@@ -186,8 +186,10 @@ export const importVocabularyFunction = onRequest(
         logger.error("Error parsing AI response:", parseErr);
         response
           .status(500)
-          .json({error: "Unexpected model response format " +
-                  "(JSON parse failed)"});
+          .json({
+            error: "Unexpected model response format " +
+                            "(JSON parse failed)",
+          });
         return;
       }
 
@@ -205,3 +207,133 @@ export const importVocabularyFunction = onRequest(
     }
   }
 );
+
+export const getWordCoreInfo = onRequest({region: "europe-west3"}, async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+
+  const {knownLanguage, learnLanguage, knownWord, learnWord} = req.body;
+
+  if (!knownLanguage || !learnLanguage || !knownWord || !learnWord) {
+    res.status(400).json({error: "Missing required parameters"});
+    return;
+  }
+
+  const prompt = `
+I am a ${knownLanguage} speaker learning ${learnLanguage}.
+Provide information about the ${learnLanguage} word "${learnWord}"
+ (${knownWord} in ${knownLanguage}).
+Return a single JSON object with the following properties:
+- partOfSpeech: array of POS tags in ${learnLanguage}
+- synonyms: array of a few close synonyms in ${learnLanguage}
+- antonyms: array of a few antonyms if applicable in ${learnLanguage}
+- examples: array with 2–3 objects { learnLanguageSentence, translation } 
+where learnLanguageSentence is in ${learnLanguage} and the  translation is in ${knownLanguage}
+
+Only output valid JSON and nothing else.
+  `;
+
+  try {
+    const aiResponse = await ai.models.generateContent({
+      model: model,
+      contents: [
+        {
+          role: "user",
+          parts: [{text: prompt}],
+        },
+      ],
+      config: {
+        temperature: 0.7,
+        topP: 1,
+        maxOutputTokens: 2048,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "object",
+          properties: {
+            partOfSpeech: {type: "array", items: {type: "string"}},
+            synonyms: {type: "array", items: {type: "string"}},
+            antonyms: {type: "array", items: {type: "string"}},
+            examples: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  learnLanguageSentence: {type: "string"},
+                  translation: {type: "string"},
+                },
+                required: ["learnLanguageSentence", "translation"],
+              },
+            },
+          },
+          required: ["partOfSpeech", "examples"],
+        },
+      },
+    });
+
+    // handle token limit
+    const finishReason = aiResponse.candidates?.[0]?.finishReason;
+    if (finishReason === "MAX_TOKENS") {
+      res.status(500).json({error: "Max amount of tokens reached"});
+      return;
+    }
+
+    // extract raw text (stringified JSON)
+    const rawText = aiResponse.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) {
+      res.status(500).json({error: "Output is empty"});
+      return;
+    }
+
+    // parse JSON safely and validate shape
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (parseErr) {
+      logger.error("Error parsing AI response:", parseErr);
+      res.status(500).json({
+        error: "Unexpected model response format (JSON parse failed)",
+      });
+      return;
+    }
+
+    // Validate it's an object and required fields exist
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      res
+        .status(500)
+        .json({error: "Unexpected model response format (expected object)"});
+      return;
+    }
+
+    if (!Array.isArray(parsed.partOfSpeech) || !Array.isArray(parsed.examples)) {
+      res.status(500).json({
+        error:
+                    "Unexpected model response format " +
+            "(missing required fields: partOfSpeech/examples)",
+      });
+      return;
+    }
+
+    // Optional: ensure examples array items have required props
+    const badExample = parsed.examples.find(
+      (ex: { learnLanguageSentence: string; translation: string; }) =>
+        !ex ||
+                typeof ex.learnLanguageSentence !== "string" ||
+                typeof ex.translation !== "string"
+    );
+    if (badExample) {
+      res.status(500).json({
+        error:
+                    "Unexpected model response format" +
+            " (examples must contain learnLanguageSentence and translation strings)",
+      });
+      return;
+    }
+
+    // All good — return single word object
+    res.json(parsed);
+  } catch (err) {
+    logger.error("Error generating word info:", err);
+    res.status(500).json({error: "Failed to fetch word info"});
+  }
+});
